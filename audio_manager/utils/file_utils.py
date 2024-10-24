@@ -1,9 +1,8 @@
-import os
 from datetime import datetime
 from pathlib import Path
 
 def parse_audio_filename(filename):
-    """Parse audio filename in format YYMMDD_HHMM"""
+    """Parse filename in format YYMMDD_HHMM"""
     try:
         date_str = filename[:6]
         time_str = filename[7:11]
@@ -20,16 +19,15 @@ def parse_audio_filename(filename):
         return None
 
 def get_audio_files(directory):
-    """Get all audio files from directory with parsed timestamps"""
+    """Get list of audio files with timestamps"""
     files = []
-    for file in os.listdir(directory):
-        if file.endswith(('.mp3', '.tmk')):
-            timestamp = parse_audio_filename(file)
-            if timestamp:
-                files.append({
-                    'filename': file,
-                    'path': os.path.join(directory, file),
-                    'timestamp': timestamp
-                })
+    for file in Path(directory).glob('*.mp3'):
+        timestamp = parse_audio_filename(file.stem)
+        if timestamp:
+            files.append({
+                'path': str(file),
+                'filename': file.name,
+                'timestamp': timestamp
+            })
     
     return sorted(files, key=lambda x: x['timestamp'], reverse=True)

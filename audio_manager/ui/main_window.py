@@ -1,205 +1,21 @@
-import sys
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                           QHBoxLayout, QPushButton, QTreeWidget, QTreeWidgetItem, 
-                           QTextEdit, QLabel, QFileDialog, QProgressBar, 
-                           QSplitter, QMessageBox, QMenu, QSlider, QLineEdit,
-                           QToolBar, QStatusBar)
-from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QSettings, QSize, QTimer,
-                         QFileSystemWatcher, QMutex)
-from PyQt6.QtGui import QAction, QFont, QKeySequence
-import soundfile as sf
-import sounddevice as sd
-import numpy as np
-import pygame
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                           QPushButton, QTreeWidget, QTreeWidgetItem, QTextEdit,
+                           QLabel, QFileDialog, QProgressBar, QSplitter, 
+                           QMessageBox, QMenu, QSlider, QLineEdit, QToolBar,
+                           QStatusBar)
+from PyQt6.QtCore import Qt, QTimer, QFileSystemWatcher, QSettings, QThread
+from PyQt6.QtGui import QAction
+from datetime import timedelta
+from pathlib import Path
 import whisper
 import os
-from datetime import datetime, timedelta
-import json
-import sqlite3
-from pathlib import Path
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
-class Database:
-    def __init__(self, db_path='transcriptions.db'):
-        self.db_path = db_path
-        self.mutex = threading.Lock()
-        self.setup_database()
-    
-    def setup_database(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS transcriptions (
-                    file_path TEXT PRIMARY KEY,
-                    transcript TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    last_modified DATETIME,
-                    status TEXT DEFAULT 'pending'
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS search_index (
-                    file_path TEXT,
-                    word TEXT,
-                    position INTEGER,
-                    FOREIGN KEY(file_path) REFERENCES transcriptions(file_path)
-                )
-            ''')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_word ON search_index(word)')
-    
-    def add_transcription(self, file_path, transcript):
-        with self.mutex, sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO transcriptions 
-                (file_path, transcript, last_modified, status) 
-                VALUES (?, ?, ?, ?)
-            ''', (file_path, transcript, 
-                  datetime.fromtimestamp(os.path.getmtime(file_path)),
-                  'completed'))
-            
-            # Update search index
-            conn.execute('DELETE FROM search_index WHERE file_path = ?', 
-                       (file_path,))
-            words = transcript.lower().split()
-            conn.executemany('''
-                INSERT INTO search_index (file_path, word, position) 
-                VALUES (?, ?, ?)
-            ''', [(file_path, word, pos) for pos, word in enumerate(words)])
-    
-    def get_transcription(self, file_path):
-        with sqlite3.connect(self.db_path) as conn:
-            result = conn.execute('''
-                SELECT transcript FROM transcriptions 
-                WHERE file_path = ? AND status = 'completed'
-            ''', (file_path,)).fetchone()
-            return result[0] if result else None
+from audio_manager.database import Database
+from audio_manager.audio_player import AudioPlayer
+from audio_manager.transcription import TranscriptionWorker
+from audio_manager.utils.file_utils import get_audio_files
 
-    def search_transcripts(self, query):
-        with sqlite3.connect(self.db_path) as conn:
-            return conn.execute('''
-                SELECT DISTINCT t.file_path, t.transcript 
-                FROM transcriptions t
-                JOIN search_index si ON t.file_path = si.file_path
-                WHERE si.word LIKE ? AND t.status = 'completed'
-                ORDER BY t.timestamp DESC
-            ''', (f'%{query.lower()}%',)).fetchall()
-
-class AudioPlayer:
-    def __init__(self):
-        self.current_file = None
-        self.data = None
-        self.samplerate = None
-        self.position = 0
-        self.playing = False
-        self.stream = None
-        self.lock = threading.Lock()
-        
-        # Create a stream with callback
-        self.stream = sd.OutputStream(
-            channels=2,
-            callback=self.callback,
-            finished_callback=self.finished_callback
-        )
-        self.stream.start()
-    
-    def load_file(self, file_path):
-        with self.lock:
-            try:
-                self.data, self.samplerate = sf.read(file_path)
-                if len(self.data.shape) == 1:  # Mono
-                    self.data = np.column_stack((self.data, self.data))
-                self.current_file = file_path
-                self.position = 0
-                return True, ""
-            except Exception as e:
-                return False, str(e)
-    
-    def play(self):
-        with self.lock:
-            self.playing = True
-    
-    def pause(self):
-        with self.lock:
-            self.playing = False
-    
-    def stop(self):
-        with self.lock:
-            self.playing = False
-            self.position = 0
-    
-    def seek(self, position_seconds):
-        with self.lock:
-            if self.data is not None and self.samplerate is not None:
-                self.position = int(position_seconds * self.samplerate)
-                self.position = min(self.position, len(self.data))
-    
-    def get_position(self):
-        with self.lock:
-            if self.samplerate is not None:
-                return self.position / self.samplerate
-            return 0
-    
-    def get_duration(self):
-        with self.lock:
-            if self.data is not None and self.samplerate is not None:
-                return len(self.data) / self.samplerate
-            return 0
-    
-    def callback(self, outdata, frames, time, status):
-        with self.lock:
-            if self.data is None or not self.playing:
-                outdata.fill(0)
-                return
-            
-            if self.position >= len(self.data):
-                self.playing = False
-                outdata.fill(0)
-                return
-            
-            # Calculate how many frames we can write
-            remaining = len(self.data) - self.position
-            valid_frames = min(frames, remaining)
-            outdata[:valid_frames] = self.data[self.position:self.position + valid_frames]
-            
-            if valid_frames < frames:
-                outdata[valid_frames:] = 0
-            
-            self.position += valid_frames
-    
-    def finished_callback(self):
-        with self.lock:
-            self.playing = False
-            self.position = 0
-
-class TranscriptionWorker(QThread):
-    finished = pyqtSignal(str, str)  # file_path, transcript
-    error = pyqtSignal(str)
-    progress = pyqtSignal(int)
-
-    def __init__(self, model, file_path):
-        super().__init__()
-        self.model = model
-        self.file_path = file_path
-
-    def run(self):
-        try:
-            # Emit initial progress
-            self.progress.emit(10)
-            
-            # Load audio
-            self.progress.emit(30)
-            
-            # Perform transcription
-            result = self.model.transcribe(self.file_path)
-            
-            # Complete
-            self.progress.emit(100)
-            
-            self.finished.emit(self.file_path, result["text"])
-        except Exception as e:
-            self.error.emit(str(e))
-
-class AudioManager(QMainWindow):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Audio Manager Pro")
@@ -226,7 +42,7 @@ class AudioManager(QMainWindow):
         # Add position update timer
         self.position_timer = QTimer()
         self.position_timer.timeout.connect(self.update_position)
-        self.position_timer.start(100)  # Update every 100ms
+        self.position_timer.start(100)
         
         # Load whisper model
         self.statusBar().showMessage("Loading Whisper model...")
@@ -242,8 +58,40 @@ class AudioManager(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_files)
         self.refresh_timer.start(30000)  # Refresh every 30 seconds
-
+    
+    # UI Event Handlers
+    def on_item_selected(self, item):
+        """Handle tree item selection"""
+        file_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not file_path:
+            return
+        
+        # Load existing transcription if available
+        transcript = self.db.get_transcription(file_path)
+        if transcript:
+            self.transcription_text.setText(transcript)
+        else:
+            self.transcription_text.clear()
+    
+    def show_context_menu(self, position):
+        """Show context menu for tree items"""
+        item = self.tree.itemAt(position)
+        if not item or not item.data(0, Qt.ItemDataRole.UserRole):
+            return
+        
+        menu = QMenu()
+        transcribe_action = menu.addAction("Transcribe")
+        save_action = menu.addAction("Save Transcription")
+        
+        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        if action == transcribe_action:
+            self.transcribe_audio()
+        elif action == save_action:
+            self.save_transcription()
+    
+    # UI Setup
     def setup_ui(self):
+        """Setup the user interface"""
         # Create central widget and layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -301,7 +149,7 @@ class AudioManager(QMainWindow):
         
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setMinimum(0)
-        self.seek_slider.setMaximum(1000)  # We'll convert to/from time
+        self.seek_slider.setMaximum(1000)
         self.seek_slider.sliderMoved.connect(self.seek_audio)
         self.seek_slider.sliderPressed.connect(self.slider_pressed)
         self.seek_slider.sliderReleased.connect(self.slider_released)
@@ -344,6 +192,9 @@ class AudioManager(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
+    # ... (rest of the methods remain the same)
+
+    # Audio Control Methods
     def play_audio(self):
         """Play or pause audio"""
         if not self.audio_player.current_file:
@@ -366,15 +217,15 @@ class AudioManager(QMainWindow):
         else:
             self.audio_player.play()
             self.play_button.setText("Pause")
-    
+
     def stop_audio(self):
         """Stop audio playback"""
         self.audio_player.stop()
         self.play_button.setText("Play")
-    
+
     def set_volume(self, value):
         """Set audio volume"""
-        sd.default.output_gain = value / 100.0
+        self.audio_player.set_volume(value / 100.0)
 
     def format_time(self, seconds):
         """Convert seconds to MM:SS format"""
@@ -386,12 +237,10 @@ class AudioManager(QMainWindow):
             position = self.audio_player.get_position()
             duration = self.audio_player.get_duration()
             
-            # Update time label
             position_str = self.format_time(position)
             duration_str = self.format_time(duration)
             self.time_label.setText(f"{position_str} / {duration_str}")
             
-            # Update slider if it's not being dragged
             if not self.seek_slider.isSliderDown():
                 self.seek_slider.setValue(int(position * 1000 / duration) if duration else 0)
 
@@ -410,6 +259,7 @@ class AudioManager(QMainWindow):
             position = (value / 1000) * duration
             self.audio_player.seek(position)
 
+    # File Management Methods
     def select_directory(self):
         """Open directory selection dialog"""
         directory = QFileDialog.getExistingDirectory(
@@ -425,47 +275,21 @@ class AudioManager(QMainWindow):
                 self.file_watcher.removePath(self.directory)
             self.file_watcher.addPath(directory)
             self.refresh_files()
-    
+
     def refresh_files(self):
         """Refresh the file tree with audio files"""
         if not self.directory:
             return
         
         self.tree.clear()
-        files = []
+        audio_files = get_audio_files(self.directory)
         
-        for file in Path(self.directory).glob('*.mp3'):
-            try:
-                # Parse filename (format: YYMMDD_HHMM)
-                date_str = file.stem[:6]
-                time_str = file.stem[7:11]
-                
-                year = f"20{date_str[:2]}"
-                month = date_str[2:4]
-                day = date_str[4:6]
-                hour = time_str[:2]
-                minute = time_str[2:4]
-                
-                timestamp = datetime(int(year), int(month), int(day), 
-                                  int(hour), int(minute))
-                
-                files.append({
-                    'path': str(file),
-                    'filename': file.name,
-                    'timestamp': timestamp
-                })
-            except (ValueError, IndexError):
-                continue
-        
-        # Sort files by timestamp
-        files.sort(key=lambda x: x['timestamp'], reverse=True)
-        
-        # Build tree
+        # Build tree structure
         year_items = {}
         month_items = {}
         day_items = {}
         
-        for file in files:
+        for file in audio_files:
             timestamp = file['timestamp']
             
             # Create year node if needed
@@ -500,36 +324,8 @@ class AudioManager(QMainWindow):
             # Check if transcription exists
             if self.db.get_transcription(file['path']):
                 item.setForeground(0, Qt.GlobalColor.blue)
-    
-    def show_context_menu(self, position):
-        """Show context menu for tree items"""
-        item = self.tree.itemAt(position)
-        if not item or not item.data(0, Qt.ItemDataRole.UserRole):
-            return
-        
-        menu = QMenu()
-        transcribe_action = menu.addAction("Transcribe")
-        save_action = menu.addAction("Save Transcription")
-        
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        if action == transcribe_action:
-            self.transcribe_audio()
-        elif action == save_action:
-            self.save_transcription()
-    
-    def on_item_selected(self, item):
-        """Handle tree item selection"""
-        file_path = item.data(0, Qt.ItemDataRole.UserRole)
-        if not file_path:
-            return
-        
-        # Load existing transcription if available
-        transcript = self.db.get_transcription(file_path)
-        if transcript:
-            self.transcription_text.setText(transcript)
-        else:
-            self.transcription_text.clear()
-    
+
+    # Transcription Methods
     def transcribe_audio(self):
         """Transcribe selected audio file"""
         item = self.tree.currentItem()
@@ -550,7 +346,7 @@ class AudioManager(QMainWindow):
         self.current_transcription.error.connect(self.on_transcription_error)
         self.current_transcription.progress.connect(self.progress.setValue)
         self.current_transcription.start()
-    
+
     def on_transcription_complete(self, file_path, transcript):
         """Handle completed transcription"""
         self.transcription_text.setText(transcript)
@@ -559,14 +355,14 @@ class AudioManager(QMainWindow):
         self.transcribe_button.setEnabled(True)
         self.statusBar().showMessage("Transcription completed", 3000)
         self.refresh_files()
-    
+
     def on_transcription_error(self, error):
         """Handle transcription error"""
         self.transcription_text.setText(f"Error during transcription: {error}")
         self.progress.hide()
         self.transcribe_button.setEnabled(True)
         self.statusBar().showMessage("Transcription failed", 3000)
-    
+
     def save_transcription(self):
         """Save transcription to file"""
         item = self.tree.currentItem()
@@ -598,7 +394,8 @@ class AudioManager(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", 
                                    f"Could not save transcription: {str(e)}")
-    
+
+    # Search Methods
     def search_transcripts(self, query):
         """Search through transcriptions"""
         if len(query) < 3:  # Only search for queries with 3+ characters
@@ -614,7 +411,16 @@ class AudioManager(QMainWindow):
             item.setText(1, transcript[:100] + "...")  # Show preview
             item.setData(0, Qt.ItemDataRole.UserRole, file_path)
             item.setForeground(0, Qt.GlobalColor.blue)
-    
+
+    # Model and Settings Methods
+    def load_model(self):
+        """Load the Whisper model"""
+        self.model = whisper.load_model("base")
+
+    def on_model_loaded(self):
+        """Handle model loading completion"""
+        self.statusBar().showMessage("Ready", 3000)
+
     def restore_settings(self):
         """Restore last used directory"""
         last_dir = self.settings.value('last_directory')
@@ -622,15 +428,8 @@ class AudioManager(QMainWindow):
             self.directory = last_dir
             self.file_watcher.addPath(last_dir)
             self.refresh_files()
-    
-    def load_model(self):
-        """Load the Whisper model"""
-        self.model = whisper.load_model("base")
-    
-    def on_model_loaded(self):
-        """Handle model loading completion"""
-        self.statusBar().showMessage("Ready", 3000)
-    
+
+    # Event Handlers
     def closeEvent(self, event):
         """Handle application closure"""
         if self.current_transcription and self.current_transcription.isRunning():
@@ -647,122 +446,11 @@ class AudioManager(QMainWindow):
                 return
         
         # Stop audio if playing
-        if self.is_playing:
-            self.stop_audio()
-        
-        if hasattr(self, 'audio_player') and hasattr(self.audio_player, 'stream'):
-            self.audio_player.stream.stop()
-            self.audio_player.stream.close()
+        if self.audio_player:
+            if self.is_playing:
+                self.stop_audio()
+            self.audio_player.cleanup()
         
         # Save settings
         self.settings.sync()
         event.accept()
-
-def main():
-    # Enable high DPI scaling
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    
-    # Set up stylesheet for modern look
-    app.setStyleSheet("""
-        QMainWindow {
-            background-color: #f5f5f5;
-        }
-        QTreeWidget {
-            border: 1px solid #cccccc;
-            border-radius: 8px;
-            background-color: white;
-            padding: 5px;
-        }
-        QTreeWidget::item {
-            height: 25px;
-            padding: 2px;
-            margin: 2px;
-        }
-        QTreeWidget::item:selected {
-            background-color: #e3f2fd;
-            color: #1976d2;
-            border-radius: 4px;
-        }
-        QPushButton {
-            background-color: #1976d2;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 6px;
-            font-weight: bold;
-            min-width: 80px;
-        }
-        QPushButton:hover {
-            background-color: #1565c0;
-        }
-        QPushButton:pressed {
-            background-color: #0d47a1;
-        }
-        QPushButton:disabled {
-            background-color: #bbdefb;
-        }
-        QTextEdit {
-            border: 1px solid #cccccc;
-            border-radius: 8px;
-            background-color: white;
-            padding: 8px;
-        }
-        QProgressBar {
-            border: none;
-            border-radius: 6px;
-            background-color: #e0e0e0;
-            text-align: center;
-            color: black;
-            height: 12px;
-        }
-        QProgressBar::chunk {
-            background-color: #1976d2;
-            border-radius: 6px;
-        }
-        QLineEdit {
-            padding: 6px;
-            border: 1px solid #cccccc;
-            border-radius: 6px;
-            background-color: white;
-        }
-        QSlider::groove:horizontal {
-            border: none;
-            height: 6px;
-            background: #e0e0e0;
-            border-radius: 3px;
-        }
-        QSlider::handle:horizontal {
-            background: #1976d2;
-            border: none;
-            width: 16px;
-            height: 16px;
-            margin: -5px 0;
-            border-radius: 8px;
-        }
-        QStatusBar {
-            background-color: white;
-            border-top: 1px solid #e0e0e0;
-            padding: 4px;
-            color: #666666;
-        }
-        QToolBar {
-            background-color: white;
-            border-bottom: 1px solid #e0e0e0;
-            spacing: 10px;
-            padding: 4px;
-        }
-    """)
-    
-    window = AudioManager()
-    window.show()
-    
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
